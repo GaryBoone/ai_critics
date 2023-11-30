@@ -1,0 +1,7 @@
+Given an integer array nums, find the contiguous subarray (containing at least one number) which has
+the largest sum and return its sum.
+
+# This is solved with Kadane's Maximum Sum Subarray algorithm.
+# Sources:
+# https://leetcode.com/problems/maximum-subarray/
+# https://www.geeksforgeeks.org/largest-sum-contiguous-subarray/

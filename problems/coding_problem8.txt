@@ -1,0 +1,11 @@
+
+Given a total of N tasks that you have to pick, labelled from 0 to N-1. Some tasks may have
+prerequisite tasks, for example, to pick task 0 you have to first finish task 1, which is expressed
+as a pair: [0, 1] Given the total number of tasks and a list of prerequisite pairs, return the
+ordering of tasks you should pick to finish all tasks. There may be multiple correct orders, you
+just need to return one of them. If it is impossible to finish all tasks, return an empty array. 
+
+# This is solved with Kahn's Algorithm.
+# Sources:
+# https://leetcode.com/problems/course-schedule-ii/
+# https://www.geeksforgeeks.org/find-the-ordering-of-tasks-from-given-dependencies/

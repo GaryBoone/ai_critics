@@ -1,21 +1,31 @@
-use crate::chatter_json::ChatterJSON;
-use crate::errors::Result;
+use crate::{chatter_json::ChatterJSON, coder::Code, DoublingProgressBar};
 use async_openai::types::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
     ChatCompletionRequestUserMessageArgs,
 };
+use color_eyre::eyre::Result;
 
 const FIXER_NAME: &str = "Fixer";
 const SYSTEM_PROMPT: &str =
-    "You will be given a coding goal, then an example program to attempts to solve it, then one or \
-     more suggested corrections. Each of these is separated by a line of `------`. For each \
-     suggested correction, first decide if it is a legitimate criticism. For the legitimate \
-     ones, correct the program according to the suggestion. Add no explanations. Ensure that it \
-     includes tests demonstrating that the original coding goal is solved. Return the corrected \
-     code as JSON. ";
+    "You will be given a coding goal, then an example program to attempts to solve it, then some 
+     suggested corrections. Each of these is separated by a line of `------`. Correct the 
+     program using all of the suggestions. Use the following steps:
+     1. Combine similarly worded, but duplicate suggestions.
+     2. Decide if an alternative implementation or data structure is needed to implement the 
+        suggestions.
+     3. Follow the implications of the suggestions to their conclusions, such as removing `use` 
+        statements if you remove the items they import.
+     4. Choose the solution approach that implements all of the suggestions.
+     5. Write the code that implements the new solution.
+     6. Review and modify the code for solution correctness.
+     7. Review and modify the code for syntax errors.
+     8. Review and modify the code to ensure that all of the suggestions are implemented.
+     9. Ensure that the new code includes tests demonstrating that the original coding goal is
+        solved. 
+     10. Return the corrected code as JSON in a field called `code`.";
 
 pub struct FixerAgent {
-    name: String,
+    pub name: String,
     system_msg: ChatCompletionRequestMessage,
     chatter: ChatterJSON,
 }
@@ -34,12 +44,18 @@ impl FixerAgent {
         })
     }
 
-    pub async fn chat(&self, goal: &str, code: &str, criticisms: &[String]) -> Result<String> {
+    pub async fn chat(
+        &self,
+        pb: &mut DoublingProgressBar,
+        goal: &str,
+        code: &str,
+        suggestions: &[String],
+    ) -> Result<Code> {
         let msg = format!(
             "{}\n\n------\n\n{}\n\n------\n\n{}",
             goal,
             code,
-            criticisms.join("\n\n------\n\n")
+            suggestions.join("\n\n------\n\n")
         );
 
         let user_msg = ChatCompletionRequestUserMessageArgs::default()
@@ -49,18 +65,31 @@ impl FixerAgent {
 
         let json = self
             .chatter
-            .chat(&[self.system_msg.clone(), user_msg])
+            .chat(pb, &[self.system_msg.clone(), user_msg])
             .await?;
 
         // Check the fields. Should only be one: `code`.
-        let extra_keys = self.chatter.validate_fields(&json, vec!["code"])?;
+        let extra_keys = ChatterJSON::validate_fields(&json, vec!["code"])?;
         if !extra_keys.is_empty() {
             println!(
-                "{}: Extra keys in Coder response: {:?}",
+                "{}: Warning: Extra keys in fixer response: {:?}",
                 self.name, extra_keys
             );
         }
+        // TODO: Remove.
+        match serde_json::from_value::<Code>(json.clone()) {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                eprintln!("Error deserializing JSON: {}", e);
+                if let serde_json::error::Category::Data = e.classify() {
+                    eprintln!(
+                        "Data error: The structure of the JSON does not match the expected format. The icky JSON is:\n\n{:?}\n\n", json.clone()
+                    );
+                }
 
-        ChatterJSON::get_field(&json, "code")
+                Err(e.into())
+            }
+        }
+        // Ok(serde_json::from_value(json)?)
     }
 }

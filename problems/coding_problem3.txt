@@ -1,0 +1,7 @@
+Given an array coins[] of size N and a target value V, where coins[i] represents the coins of
+different denominations. You have an infinite supply of each of coins. The task is to find minimum
+number of coins required to make the given value V. If it’s not possible to make a change, print -1.
+
+# Sources:
+# https://leetcode.com/problems/coin-change
+# https://www.geeksforgeeks.org/find-minimum-number-of-coins-that-make-a-change

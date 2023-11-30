@@ -1,0 +1,6 @@
+Given n, a number of pairs of open and closed parentheses, write a function to generate all
+combinations of well-formed parentheses.
+
+# Sources:
+# https://leetcode.com/problems/generate-parentheses
+# https://www.geeksforgeeks.org/print-all-combinations-of-balanced-parentheses

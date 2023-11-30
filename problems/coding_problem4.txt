@@ -1,0 +1,17 @@
+Write a program that shows how to remove duplicate values from a sorted linked list. That is, if
+there is a sequence of values in the list that are the same, then the whole sequence should be
+removed from the list. Do not use an existing library for linked lists. Assume the following
+definition of ListNode:
+
+    #[derive(PartialEq, Eq, Clone, Debug)]
+    pub struct ListNode {
+        pub val: i32,
+        pub next: Option<Box<ListNode>>
+    }
+
+Use this signature for the function:
+    pub fn delete_duplicates(head: Option<Box<ListNode>>) -> Option<Box<ListNode>> {}
+
+# Sources: 
+# https://leetcode.com/problems/remove-duplicates-from-sorted-list
+# https://www.geeksforgeeks.org/remove-duplicates-from-a-sorted-linked-list

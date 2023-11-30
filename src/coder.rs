@@ -1,22 +1,35 @@
-use crate::chatter_json::ChatterJSON;
-use crate::errors::Result;
+use std::fmt;
+
+use crate::{chatter_json::ChatterJSON, DoublingProgressBar};
 use async_openai::types::{
     ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
     ChatCompletionRequestUserMessageArgs,
 };
+use color_eyre::eyre::Result;
+use serde::Deserialize;
 
 const CODER_NAME: &str = "Coder";
 const SYSTEM_PROMPT: &str =
-    "Write the requested program. Add no explanations. Just return the code with complete tests. \
-     The code will piped directly to the rustc compiler so should be formatted to compile. Do not \
-     offset the code with ticks or triple ticks. Output plain text. Any clarifying explanations \
-     should be included in the code as // comments. Be sure that the code includes tests that \
-     demonstrates that the code solves the requested problem. Return the response as JSON.";
+    "Write the requested program in Rust. Add no explanations. Just return the code. Include 
+     complete #[cfg(test)] unit tests. Any clarifying explanations should be included in the code
+     as // comments. Be sure that the tests demonstrate that the code solves the requested problem.
+     Return the response as JSON in a field called `code`.";
 
 pub struct CoderAgent {
-    _name: String,
+    pub name: String,
     system_msg: ChatCompletionRequestMessage,
     chatter: ChatterJSON,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct Code {
+    pub code: String,
+}
+
+impl fmt::Display for Code {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Code: {}", self.code)
+    }
 }
 
 impl CoderAgent {
@@ -27,13 +40,13 @@ impl CoderAgent {
             .into();
 
         Ok(CoderAgent {
-            _name: format!("{}_{}", CODER_NAME, id),
+            name: format!("{}_{}", CODER_NAME, id),
             system_msg,
             chatter: ChatterJSON::new(),
         })
     }
 
-    pub async fn chat(&self, msg: &str) -> Result<String> {
+    pub async fn chat(&self, pb: &mut DoublingProgressBar, msg: &str) -> Result<Code> {
         let user_msg = ChatCompletionRequestUserMessageArgs::default()
             .content(msg)
             .build()?
@@ -41,15 +54,17 @@ impl CoderAgent {
 
         let json = self
             .chatter
-            .chat(&[self.system_msg.clone(), user_msg])
+            .chat(pb, &[self.system_msg.clone(), user_msg])
             .await?;
 
         // Check the fields. Should only be one: `code`.
-        let extra_keys = self.chatter.validate_fields(&json, vec!["code"])?;
+        let extra_keys = ChatterJSON::validate_fields(&json, vec!["code"])?;
         if !extra_keys.is_empty() {
-            println!("Extra keys in Coder response: {:?}", extra_keys);
+            println!(
+                "{}: Warning: Extra keys in Coder response: {:?}",
+                self.name, extra_keys
+            );
         }
-
-        ChatterJSON::get_field(&json, "code")
+        Ok(serde_json::from_value(json)?)
     }
 }
