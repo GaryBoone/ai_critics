@@ -34,7 +34,7 @@ const NUM_DESIGN_CRITICS: usize = 5;
 const NUM_CORRECTNESS_CRITICS: usize = 5;
 const NUM_SYNTAX_CRITICS: usize = 5;
 // MAX_PROPOSALS is the maximum number of proposals that the critics will generate.
-const MAX_PROPOSALS: usize = 20;
+const MAX_PROPOSALS: i32 = 20;
 
 fn setup() -> Result<()> {
     if env::var("OPENAI_API_KEY").is_err() {
@@ -138,7 +138,7 @@ fn print_corrections(corrections: &[Correction]) {
 }
 
 // Have the AI Critics review the code. Return a list of their suggestions.
-async fn ai_review_code(proposal_count: usize, problem: &str, code: &Code) -> Result<Vec<String>> {
+async fn ai_review_code(proposal_count: i32, problem: &str, code: &Code) -> Result<Vec<String>> {
     let critics = create_critics()?;
 
     println!("Proposed code #{}: -----------\n{}", proposal_count, &code);
@@ -187,7 +187,7 @@ fn create_critics() -> Result<Vec<CriticAgent>> {
     Ok(critics)
 }
 
-fn report_test_success(proposal_count: usize, code: &str, test_output: &str) {
+fn report_test_success(proposal_count: i32, code: &str, test_output: &str) {
     println!(
         indoc! {"
             Success after {} proposals.
@@ -229,7 +229,7 @@ async fn ai_fix_code(goal: &str, code: &Code, suggestions: &[String]) -> Result<
 
 // Compile and test the code. Return an optional suggestion if the code fails to compile of fails
 // the test.
-async fn compile_and_test(proposal_count: usize, code: &Code) -> Result<Option<String>> {
+async fn compile_and_test(proposal_count: i32, code: &Code) -> Result<Option<String>> {
     println!("All of the critics agree that code is correct.");
     println!("\n==> Tester compiling and testing...");
     let tester = TesterAgent::new(1);
@@ -250,7 +250,7 @@ async fn compile_and_test(proposal_count: usize, code: &Code) -> Result<Option<S
 // Main run loop: Read the problem and run the AI agents to solve it. Use a Coder agent to produce
 // an initial solution, then in a loop run the AI critics to review the code, the fixer agent to
 // correct it, and the tester agent to test it. Repeat until it works or MAX_PROPOSALS is reached.
-async fn run() -> Result<()> {
+async fn run() -> Result<i32> {
     setup()?;
 
     let filename = env::args()
@@ -272,12 +272,12 @@ async fn run() -> Result<()> {
                 code = ai_fix_code(&goal, &code, &[suggestion]).await?;
             }
             None => {
-                break;
+                return Ok(proposal_count);
             }
         }
     }
 
-    Ok(())
+    Ok(MAX_PROPOSALS)
 }
 
 // Main entry point. Run the main loop, catching the errors. All errors should be caught and handled
@@ -286,17 +286,20 @@ async fn run() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     match run().await {
-        Ok(()) => {}
+        Ok(iteration_count) => {
+            std::process::exit(iteration_count);
+        }
         Err(e) => match e.downcast_ref::<errors::AiCriticError>() {
             // Manage the expected errors here, letting unexpected ones be reported with stack
             // traces.
             Some(AiCriticError::MaxRetriesExceeded { retries }) => {
                 println!("Too many retries ({}). Exiting.", retries);
+                std::process::exit(-1);
             }
             _ => {
                 println!("Error: {}", e);
+                std::process::exit(-1);
             }
         },
     }
-    Ok(())
 }
