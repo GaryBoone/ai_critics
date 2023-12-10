@@ -56,6 +56,21 @@ impl DoublingProgressBar {
         }
     }
 
+    // Decrement the progress, halving the max value if needed.
+    pub fn dec(&mut self) {
+        if self.current_progress == 0 {
+            return;
+        }
+        self.current_progress -= 1;
+        self.progress_bar.set_position(self.current_progress);
+
+        if self.current_progress <= self.max_value / 2 {
+            self.max_value /= 2;
+            self.max_value = self.max_value.max(1);
+            self.progress_bar.set_length(self.max_value);
+        }
+    }
+
     pub fn reset_to_zero(&mut self) {
         self.progress_bar.reset();
         self.current_progress = 0;

@@ -9,46 +9,54 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde_json::Value;
 
-// There are 3 critic agents that vary based the type of critique they give. Roughly these are:
+// There are 3 types critic agents that vary based the type of critique they give. Roughly these are:
 //
 // 1. Design: Does the code use an algorithm that will correctly solve the given coding problem?
 // 2. Correctness: Does the code solve the given coding problem?
 // 3. Syntax: Is the code syntactically correct?
 //
-//
+// As an alternative to these specialized agents, general agent combines the above into
+// a single prompt.
+
+// All critic agents share the base prompt.
 const BASE_PROMPT: &str = "
-Here is a coding problem and proposed solution separated by a line containing '------'.
-Evaluate the code based on the criteria below. Make no comments or explanations.
-Return JSON with two fields:
-1. a field named `correct` with value `true` if the code is correct, else false.
-2. a field `corrections` containing list of the errors, if any, else `None`.
+    Evaluate this code based on the criteria below. Make no comments or explanations.
+    Return JSON with two fields:
+    1. a field named `correct` with value `true` if the code is correct, else false.
+    2. a field `corrections` containing list of the errors, if any, else `None`.
+";
+
+const GENERAL_SYSTEM_PROMPT: &str = "
+    Review the code for design, correctness, and syntax issues.
 ";
 
 const DESIGN_SYSTEM_PROMPT: &str = "
-Evaluation Criteria: Evaluate the _design_ of the solution, considering the following questions: 
-1. Is this the right the design to solve the problem?
-2. Does the method chosen meet the constraints of the problem?
-3. Does it use a the correct algorithms and data structures to solve the problem?
+    Evaluation Criteria: Evaluate the _design_ of the solution, considering the following questions: 
+    1. Is this the right the design to solve the problem?
+    2. Does the method chosen meet the constraints of the problem?
+    3. Does it use a the correct algorithms and data structures to solve the problem?
 ";
 
 const CORRECTNESS_SYSTEM_PROMPT: &str = "
-Evaluation Criteria: Evaluate the _correctness_ of the solution, considering the following questions: 
-1. Does the code correctly implement the intended solution approach?
-2. Does the code generate the expected output?
-3. Does the output meet the original problem constraints?
-4. Are there enough tests to demonstrate the correctness of the solution?
-5. Do the tests correctly capture situations that validate or invalidate the solution?
+    Evaluation Criteria: Evaluate the _correctness_ of the solution, considering the following 
+    questions: 
+    1. Does the code correctly implement the intended solution approach?
+    2. Does the code generate the expected output?
+    3. Does the output meet the original problem constraints?
+    4. Are there enough tests to demonstrate the correctness of the solution?
+    5. Do the tests correctly capture situations that validate or invalidate the solution?
 ";
 
 const SYNTAX_SYSTEM_PROMPT: &str = "
-Evaluation Criteria: Evaluate the _syntax_ of the solution, considering the following questions: 
-1. Are there any syntactic errors?
-2. Will the code and tests compile and run?
-3. Are there any language errors such as borrowing violations or lifetime problems?
-4. Are there any cleanups needed such as unused variables or imports?
+    Evaluation Criteria: Evaluate the _syntax_ of the solution, considering the following questions: 
+    1. Are there any syntactic errors?
+    2. Will the code and tests compile and run?
+    3. Are there any language errors such as borrowing violations or lifetime problems?
+    4. Are there any cleanups needed such as unused variables or imports?
 ";
 
 pub enum CriticType {
+    General,
     Design,
     Correctness,
     Syntax,
@@ -95,12 +103,14 @@ where
 impl CriticAgent {
     pub fn new(critic_type: CriticType, id: usize) -> Result<Self> {
         let name = match critic_type {
+            CriticType::General => format!("General Critic {}", id),
             CriticType::Design => format!("Design Critic {}", id),
             CriticType::Correctness => format!("Correctness Critic {}", id),
             CriticType::Syntax => format!("Syntax Critic {}", id),
         };
 
         let critic_prompt = match critic_type {
+            CriticType::General => format!("{}\n{}", BASE_PROMPT, GENERAL_SYSTEM_PROMPT),
             CriticType::Design => format!("{}\n{}", BASE_PROMPT, DESIGN_SYSTEM_PROMPT),
             CriticType::Correctness => format!("{}\n{}", BASE_PROMPT, CORRECTNESS_SYSTEM_PROMPT),
             CriticType::Syntax => format!("{}\n{}", BASE_PROMPT, SYNTAX_SYSTEM_PROMPT),

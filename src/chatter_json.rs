@@ -10,13 +10,13 @@ use async_openai::{
 };
 use color_eyre::eyre::Result;
 use futures::StreamExt;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use tokio::time::timeout;
 
 const MODEL: &str = "gpt-4-1106-preview";
 //const MODEL: &str = "gpt-4"; // Try comparing.
-const MAX_TOKENS: u16 = 2048;
+const MAX_TOKENS: u16 = 4096;
 const TEMPERATURE: f32 = 0.1;
 const MAX_RETRIES: usize = 5;
 const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
@@ -25,7 +25,7 @@ const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(30)
 // will return a 'Length' stop reason in the response's ChatChoice. But there's no reason to wait
 // for the full max_tokens to be exhausted with empty chunks before noticing the abnormal response.
 // Instead, we'll allow only MAX_CONSECUTIVE_BLANKS consecutive empty chunks in the response stream.
-const MAX_CONSECUTIVE_BLANKS: usize = 100;
+const MAX_CONSECUTIVE_BLANKS: usize = 300;
 
 #[derive(PartialEq)]
 enum ProcessingOutcome {
@@ -73,6 +73,7 @@ impl ChatterJSON {
     // Process the chunk, accumulating them into `chunks`. Also, watch for a finish reason to be
     // returned and watch for excessive blank chunks. Return true if the request should be retried.
     fn process_chunk(
+        pb: &mut DoublingProgressBar,
         response: async_openai::types::CreateChatCompletionStreamResponse,
         chunks: &mut Vec<String>,
         consecutive_blanks: &mut usize,
@@ -88,7 +89,13 @@ impl ChatterJSON {
         let chat_choice = &response.choices[0];
         if let Some(ref content) = chat_choice.delta.content {
             chunks.push(content.clone());
+            if content.trim().is_empty() {
+                pb.dec();
+            } else {
+                pb.inc();
+            }
             if Self::check_for_excessive_blanks(consecutive_blanks, content) {
+                println!("Retrying due to too many empty chunks returned by the API.");
                 return true;
             }
         }
@@ -112,10 +119,10 @@ impl ChatterJSON {
 
         let mut consecutive_blanks = 0;
         loop {
-            pb.inc();
             match timeout(TIMEOUT_DURATION, stream.next()).await {
                 Ok(Some(message)) => {
                     if Self::process_chunk(
+                        pb,
                         message?,
                         &mut chunks,
                         &mut consecutive_blanks,
@@ -139,54 +146,119 @@ impl ChatterJSON {
         ))
     }
 
-    // Process the JSON Value returned by the OpenAI API. In some of our System messages, we
-    // instruct GPT-4 to generate a code snippet. It should be returned in the Value as a field
-    // called 'code' with a String value. However, it is sometimes returned as an Object value
-    // instead. This function will handle both cases, returning the value of the 'code' field as a
-    // String.
-    fn process_code_value(
-        map: &Map<String, Value>,
-        pb: &mut DoublingProgressBar,
-    ) -> Result<ProcessingOutcome> {
-        {
-            match map.get("code") {
-                Some(Value::Object(_)) => {
-                    // The code value is an object instead of a String. For example:
-                    //   [Object {"code": Object("...")}]
-                    // TODO: Remove.
-                    pb.clone().println("[OK] Found Object in JSON object");
-
-                    // Recreate the code value as a String.
-                    let serialized = map["code"].to_string();
-                    let new_value = Value::Object(
-                        [("code".to_string(), Value::String(serialized))]
-                            .iter()
-                            .cloned()
-                            .collect(),
+    fn describe_value(value: &Value, indent: usize) {
+        match value {
+            Value::Object(map)
+                if map.contains_key("correct") && map.contains_key("corrections") =>
+            {
+                log::info!("{}> Found a Correction", "-".repeat(indent));
+            }
+            Value::Object(map) if map.contains_key("code") => {
+                log::info!(
+                    "{}> Found a Code (checking the value of map['code']):\n",
+                    "-".repeat(indent)
+                );
+                Self::describe_value(&map["code"], indent + 2);
+            }
+            Value::Object(map) => {
+                log::info!("{}> Found an object in JSON object:\n", "-".repeat(indent));
+                log::info!(
+                    "{}> [[[\nThe object is:\n{:?}\n]]]",
+                    "-".repeat(indent),
+                    &map
+                );
+                for k in map.keys() {
+                    log::info!(
+                        "{}> It has String key: ``{}``\n(checking the value...)",
+                        "-".repeat(indent),
+                        k
                     );
-                    Ok(ProcessingOutcome::Done(new_value))
+                    Self::describe_value(&map[k], indent + 2);
                 }
-                _ => {
-                    // This is expected if the code object isn't nested:
-                    //   [Object {"code": String("...")}]
-                    Ok(ProcessingOutcome::Done(Value::Object(map.clone())))
+            }
+            Value::Array(array) => {
+                log::info!("{}> Found array in JSON object:\n", "-".repeat(indent));
+                for v in array {
+                    Self::describe_value(v, indent + 2);
                 }
+            }
+            Value::String(s) => {
+                log::info!(
+                    "{}> Found string in JSON object:\n{}",
+                    "-".repeat(indent),
+                    s
+                );
+            }
+            Value::Number(n) => {
+                log::info!("{}> Found number in JSON object: {}", "-".repeat(indent), n);
+            }
+            Value::Bool(b) => {
+                log::info!(
+                    "{}> Found boolean in JSON object: {}",
+                    "-".repeat(indent),
+                    b
+                );
+            }
+            Value::Null => {
+                log::info!("{}> Found null in JSON object", "-".repeat(indent));
+            }
+        }
+    }
+
+    // Process the JSON Value returned by the OpenAI API. In some of our System messages, we
+    // instruct GPT-4 to generate a code snippet. The API should return an an Object (Map<String,
+    // Value>) with a key 'code' and a String value. However, the value is sometimes an Object or
+    // other value. This function will parse the known variations and return the correct Object
+    // (Map<String, String>) as a Value so that can be parsed by serde into a Code object elsewhere.
+    // If it can't find a parsable value, it will return a retry request.
+    fn process_code_value(map: &Map<String, Value>) -> Result<ProcessingOutcome> {
+        match map.get("code") {
+            None => {
+                log::info!("The 'code' value is missing. Retrying");
+                Ok(ProcessingOutcome::Retry)
+            }
+            Some(Value::String(_)) => {
+                // Ideal: The code value is a String.
+                // This is expected if the code object isn't nested:
+                //   [Object {"code": String("...")}]
+                Ok(ProcessingOutcome::Done(Value::Object(map.clone())))
+            }
+            Some(Value::Object(m)) => {
+                // The code value is an object instead of a String. For example:
+                //    [Object {"code": Object("...")}]
+                // Sometimes, the API returns the value as an Object that has the code as both the
+                // key and the value. Weird! Check for this case and recover.
+                if m.len() != 1 {
+                    log::info!(
+                        "Found an object for the 'code' value with {} keys. Retrying",
+                        map.keys().len()
+                    );
+                    Ok(ProcessingOutcome::Retry)
+                } else {
+                    let (key, value) = m.iter().next().unwrap();
+                    // Sometimes the API returns the code as the key and a comment as the value.
+                    log::info!("Found a key / value for the 'code'. Returning the key");
+                    log::info!("The Value is:");
+                    Self::describe_value(value, 0);
+                    Ok(ProcessingOutcome::Done(json!({ "code": key })))
+                }
+            }
+            _ => {
+                log::info!("Found an expected type for the 'code' value. Retrying; here it is:");
+                Self::describe_value(map.get("code").unwrap(), 0);
+                Ok(ProcessingOutcome::Retry)
             }
         }
     }
 
     // Process the JSON string returned by the OpenAI API when the STOP finish reason is returned.
     // Return it as a Value for further processing.
-    fn process_stop(json_str: String, pb: &mut DoublingProgressBar) -> Result<ProcessingOutcome> {
+    fn process_stop(json_str: String) -> Result<ProcessingOutcome> {
         let value: Value = serde_json::from_str(&json_str)?;
         match &value {
-            // Check for the case where the API returns the code value as an Object instead of a
-            // String.
-            Value::Object(map) if map.contains_key("code") => Self::process_code_value(map, pb),
-            Value::Object(_) => {
-                // This is expected if the API isn't trying to return a code object.
-                Ok(ProcessingOutcome::Done(value))
-            }
+            // Code objects need extra processing...
+            Value::Object(map) if map.contains_key("code") => Self::process_code_value(map),
+            Value::Object(_) => Ok(ProcessingOutcome::Done(value)),
             _ => Err(AiCriticError::UnexpectedJsonStructure { json: value }.into()),
         }
     }
@@ -201,7 +273,7 @@ impl ChatterJSON {
         finish_reason: Option<FinishReason>,
     ) -> Result<ProcessingOutcome> {
         match finish_reason {
-            Some(FinishReason::Stop) => Self::process_stop(json_str, pb),
+            Some(FinishReason::Stop) => Self::process_stop(json_str),
             Some(FinishReason::Length) => {
                 pb.clone().println("Retrying due to unfinished chat.");
                 pb.reset_to_zero();
@@ -239,8 +311,6 @@ impl ChatterJSON {
                     }
                 }
                 Ok(ProcessingOutcome::Retry) => {
-                    pb.clone()
-                        .println("Retrying due to too many empty chunks returned by the API.");
                     pb.reset_to_zero();
                 }
                 Ok(ProcessingOutcome::Done(_)) => unreachable!(),

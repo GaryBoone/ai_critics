@@ -1,8 +1,10 @@
+use crate::critic::CriticType;
+use clap::Parser;
 use coder::{Code, CoderAgent};
 use color_eyre::Result;
 use critic::{Correction, CriticAgent};
 use errors::AiCriticError;
-use fixer::FixerAgent;
+use fixer::{FixerAgent, ReviewNeeded, ReviewType};
 use futures::future::join_all;
 use indicatif::MultiProgress;
 use indoc::indoc;
@@ -16,8 +18,6 @@ use std::process::exit;
 use tester::{TesterAgent, TesterResult};
 use tokio::task::JoinHandle;
 
-use crate::critic::CriticType;
-
 mod backtraces;
 mod chatter_json;
 mod coder;
@@ -29,20 +29,38 @@ mod tester;
 
 // The default problem file if none is specified.
 const DEFAULT_PROBLEM_FILE: &str = "problems/coding_problem1.txt";
-// NUM_CRITICS is the number of critics that will be used.
-const NUM_DESIGN_CRITICS: usize = 5;
-const NUM_CORRECTNESS_CRITICS: usize = 5;
-const NUM_SYNTAX_CRITICS: usize = 5;
-// MAX_PROPOSALS is the maximum number of proposals that the critics will generate.
-const MAX_PROPOSALS: i32 = 20;
+// NUM_CRITICS is the number of each kind of critic that will be used.
+const DEFAULT_NUM_CRITICS: usize = 1;
+// MAX_PROPOSALS is the maximum number of attempts to solve the coding problem.
+const MAX_PROPOSALS: usize = 20;
 
-fn setup() -> Result<()> {
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Number of critics to use.
+    #[arg(short, long, default_value_t = DEFAULT_NUM_CRITICS)]
+    num_critics: usize,
+
+    /// Problem file to use.
+    #[arg(short, long, default_value_t = DEFAULT_PROBLEM_FILE.to_string())]
+    problem_file: String,
+
+    /// Use only a general critic.
+    #[arg(short, long, default_value_t = false)]
+    general_critic_only: bool,
+}
+
+fn setup() -> Result<Args> {
+    pretty_env_logger::init();
+
     if env::var("OPENAI_API_KEY").is_err() {
         println!("Please set the OPENAI_API_KEY environment variable.");
         exit(1);
     }
 
-    backtraces::setup_color_eyre()
+    backtraces::setup_color_eyre()?;
+
+    Ok(Args::parse())
 }
 
 // Read the file with the given filename in the project root, ignoring lines starting with '#'.
@@ -108,7 +126,7 @@ fn spawn_critics(
     Ok((tasks, multi_progress))
 }
 
-fn collect_suggestions(
+fn collect_comments(
     results: Vec<Result<Result<Correction>, tokio::task::JoinError>>,
 ) -> Result<Vec<Correction>> {
     let mut corrections = Vec::new();
@@ -137,11 +155,21 @@ fn print_corrections(corrections: &[Correction]) {
     }
 }
 
-// Have the AI Critics review the code. Return a list of their suggestions.
-async fn ai_review_code(proposal_count: i32, problem: &str, code: &Code) -> Result<Vec<String>> {
-    let critics = create_critics()?;
+// Have the AI Critics review the code. Return ReviewNeeded with their comments or None if all of
+// them agree that the code is correct.
+async fn ai_review_code(
+    num_critics: usize,
+    proposal_count: usize,
+    problem: &str,
+    code: &Code,
+    general_critic_only: bool,
+) -> Result<Option<ReviewNeeded>> {
+    let critics = create_critics(num_critics, general_critic_only)?;
 
-    println!("Proposed code #{}: -----------\n{}", proposal_count, &code);
+    println!(
+        "Proposed code #{}: -----------\n{}",
+        proposal_count, &code.code
+    );
     println!("------------------------------\n");
     println!("\n==> Critics reviewing...");
 
@@ -153,15 +181,20 @@ async fn ai_review_code(proposal_count: i32, problem: &str, code: &Code) -> Resu
     multi_progress.clear()?;
 
     // Collect the results.
-    let corrections = collect_suggestions(results)?;
+    let corrections = collect_comments(results)?;
 
     print_corrections(&corrections);
 
-    // For the Corrections that are incorrect, collect the suggestions into a HashSet, deduping
-    // them. Note that suggestions from GPT are often the same idea but using different words, so
+    if corrections.iter().all(|item| item.correct) {
+        println!("All of the critics agree that code is correct.");
+        return Ok(None);
+    }
+
+    // For the Corrections that are incorrect, collect the review comments into a HashSet, deduping
+    // them. Note that comments from GPT are often the same idea but using different words, so
     // this deduplication only removes the less frequent literal duplicates. Return them as a
     // Vec<String>.
-    let suggestions: Vec<String> = corrections
+    let comments: Vec<String> = corrections
         .iter()
         .filter(|cs| !cs.correct)
         .flat_map(|cs| &cs.corrections)
@@ -170,24 +203,33 @@ async fn ai_review_code(proposal_count: i32, problem: &str, code: &Code) -> Resu
         .into_iter()
         .collect();
 
-    Ok(suggestions)
+    Ok(Some(ReviewNeeded {
+        review_type: ReviewType::CodeReview,
+        comments,
+    }))
 }
 
-fn create_critics() -> Result<Vec<CriticAgent>> {
+fn create_critics(num_critics: usize, general_critics_only: bool) -> Result<Vec<CriticAgent>> {
     let mut critics = vec![];
-    for i in 1..=NUM_DESIGN_CRITICS {
-        critics.push(CriticAgent::new(CriticType::Design, i)?);
-    }
-    for i in 1..=NUM_CORRECTNESS_CRITICS {
-        critics.push(CriticAgent::new(CriticType::Correctness, i)?);
-    }
-    for i in 1..=NUM_SYNTAX_CRITICS {
-        critics.push(CriticAgent::new(CriticType::Syntax, i)?);
+    if general_critics_only {
+        for i in 1..=num_critics {
+            critics.push(CriticAgent::new(CriticType::General, i)?);
+        }
+    } else {
+        for i in 1..=num_critics {
+            critics.push(CriticAgent::new(CriticType::Design, i)?);
+        }
+        for i in 1..=num_critics {
+            critics.push(CriticAgent::new(CriticType::Correctness, i)?);
+        }
+        for i in 1..=num_critics {
+            critics.push(CriticAgent::new(CriticType::Syntax, i)?);
+        }
     }
     Ok(critics)
 }
 
-fn report_test_success(proposal_count: i32, code: &str, test_output: &str) {
+fn report_test_success(proposal_count: usize, code: &str, test_output: &str) {
     println!(
         indoc! {"
             Success after {} proposals.
@@ -216,21 +258,19 @@ fn report_tester_failure(stderr: &str) {
     );
 }
 
-// Have the AI Fixer agent correct the code given the critics' suggestions.
-async fn ai_fix_code(goal: &str, code: &Code, suggestions: &[String]) -> Result<Code> {
+// Have the AI Fixer agent correct the code given the critics' comments.
+async fn ai_fix_code(code: &Code, review: ReviewNeeded) -> Result<Code> {
     println!("\n==> Fixer correcting...");
 
     let fixer1 = FixerAgent::new(1)?;
     let mut pb = DoublingProgressBar::new(&fixer1.name)?;
-    let code = fixer1.chat(&mut pb, goal, &code.code, suggestions).await?;
-    println!("Fixer corrects to:\n{}", code);
+    let code = fixer1.chat(&mut pb, &code.code, review).await?;
     Ok(code)
 }
 
-// Compile and test the code. Return an optional suggestion if the code fails to compile of fails
+// Compile and test the code. Return an optional ReviewNeeded if the code fails to compile or fails
 // the test.
-async fn compile_and_test(proposal_count: i32, code: &Code) -> Result<Option<String>> {
-    println!("All of the critics agree that code is correct.");
+async fn compile_and_test(proposal_count: usize, code: &Code) -> Result<Option<ReviewNeeded>> {
     println!("\n==> Tester compiling and testing...");
     let tester = TesterAgent::new(1);
 
@@ -239,10 +279,13 @@ async fn compile_and_test(proposal_count: i32, code: &Code) -> Result<Option<Str
             report_test_success(proposal_count, &code.code, &stdout);
             Ok(None)
         }
-        TesterResult::Failure { stdout, suggestion } => {
+        TesterResult::Failure {
+            output: stdout,
+            review,
+        } => {
             report_tester_failure(&stdout);
             // Continue, seeing if the AI can fix the code/tests so it passes.
-            Ok(Some(suggestion))
+            Ok(Some(review))
         }
     }
 }
@@ -250,26 +293,28 @@ async fn compile_and_test(proposal_count: i32, code: &Code) -> Result<Option<Str
 // Main run loop: Read the problem and run the AI agents to solve it. Use a Coder agent to produce
 // an initial solution, then in a loop run the AI critics to review the code, the fixer agent to
 // correct it, and the tester agent to test it. Repeat until it works or MAX_PROPOSALS is reached.
-async fn run() -> Result<i32> {
-    setup()?;
+async fn run() -> Result<usize> {
+    let args = setup()?;
 
-    let filename = env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_PROBLEM_FILE.to_string());
+    let problem = read_coding_problem(&args.problem_file)?;
 
-    let goal = read_coding_problem(&filename)?;
-
-    let mut code = ai_write_code(&goal).await?;
+    let mut code = ai_write_code(&problem).await?;
 
     for proposal_count in 1..=MAX_PROPOSALS {
-        let suggestions = ai_review_code(proposal_count, &goal, &code).await?;
-
-        if !suggestions.is_empty() {
-            code = ai_fix_code(&goal, &code, &suggestions).await?;
+        let review_res = ai_review_code(
+            args.num_critics,
+            proposal_count,
+            &problem,
+            &code,
+            args.general_critic_only,
+        )
+        .await?;
+        if let Some(review_needed) = review_res {
+            code = ai_fix_code(&code, review_needed).await?;
         }
         match compile_and_test(proposal_count, &code).await? {
-            Some(suggestion) => {
-                code = ai_fix_code(&goal, &code, &[suggestion]).await?;
+            Some(review_needed) => {
+                code = ai_fix_code(&code, review_needed).await?;
             }
             None => {
                 return Ok(proposal_count);
@@ -277,28 +322,35 @@ async fn run() -> Result<i32> {
         }
     }
 
-    Ok(MAX_PROPOSALS)
+    Err(AiCriticError::MaxProposalsExceeded {
+        proposals: MAX_PROPOSALS,
+    }
+    .into())
 }
 
 // Main entry point. Run the main loop, catching the errors. All errors should be caught and handled
 // here. Errors that are not caught are development errors that are printed with a stack trace for
-// debugging.
+// debugging. Return code 0 indicates an error while >1 is the number of iterations it took to
+// solve the problem. 255 means that the program failed to converge.
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     match run().await {
         Ok(iteration_count) => {
-            std::process::exit(iteration_count);
+            std::process::exit(iteration_count as i32);
         }
         Err(e) => match e.downcast_ref::<errors::AiCriticError>() {
             // Manage the expected errors here, letting unexpected ones be reported with stack
             // traces.
-            Some(AiCriticError::MaxRetriesExceeded { retries }) => {
-                println!("Too many retries ({}). Exiting.", retries);
-                std::process::exit(-1);
+            Some(AiCriticError::MaxProposalsExceeded { proposals }) => {
+                println!(
+                    "The AI critics failed to converge on a solution in {} proposals. Exiting.",
+                    proposals
+                );
+                std::process::exit(255);
             }
             _ => {
                 println!("Error: {}", e);
-                std::process::exit(-1);
+                std::process::exit(0);
             }
         },
     }

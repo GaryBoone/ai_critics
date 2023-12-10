@@ -32,8 +32,8 @@ pub enum AiCriticError {
     #[error("the process was terminated by signal")]
     ProcessTerminated,
 
-    #[error("the test exited with code {}", code)]
-    TestingFailed { code: i32 },
+    #[error("the test exited with exit code {}", exit_code)]
+    TestingFailed { exit_code: i32 },
 
     #[error("the returned JSON is not an object")]
     NotJsonObject,
@@ -50,8 +50,11 @@ pub enum AiCriticError {
         source: serde_json::Error,
     },
 
-    #[error("too many retries: {}", retries)]
+    #[error("too many API retries: {}", retries)]
     MaxRetriesExceeded { retries: usize },
+
+    #[error("too many proposals: {}", proposals)]
+    MaxProposalsExceeded { proposals: usize },
 }
 
 // Here's how to define a Result<> type for AiCriticError:

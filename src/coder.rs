@@ -9,11 +9,14 @@ use color_eyre::eyre::Result;
 use serde::Deserialize;
 
 const CODER_NAME: &str = "Coder";
-const SYSTEM_PROMPT: &str =
-    "Write the requested program in Rust. Add no explanations. Just return the code. Include 
-     complete #[cfg(test)] unit tests. Any clarifying explanations should be included in the code
-     as // comments. Be sure that the tests demonstrate that the code solves the requested problem.
-     Return the response as JSON in a field called `code`.";
+const SYSTEM_PROMPT: &str = "
+    Write the requested program in Rust. Include complete unit tests. Return the code as JSON in a 
+    string field called `code`.
+    Any clarifying explanations should be included in the code as // comments. 
+    Be sure that the tests demonstrate that the code solves the requested problem. 
+    Any `assert` used should include a custom message with a unique 6-digit hex number labelled 
+    `assert_id` that uniquely identifies the assert line so that line numbers are not required.
+";
 
 pub struct CoderAgent {
     pub name: String,
@@ -28,7 +31,7 @@ pub struct Code {
 
 impl fmt::Display for Code {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Code: {}", self.code)
+        write!(f, "Code:\n{}", self.code)
     }
 }
 

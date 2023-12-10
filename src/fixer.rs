@@ -6,23 +6,39 @@ use async_openai::types::{
 use color_eyre::eyre::Result;
 
 const FIXER_NAME: &str = "Fixer";
-const SYSTEM_PROMPT: &str =
-    "You will be given a coding goal, then an example program to attempts to solve it, then some 
-     suggested corrections. Each of these is separated by a line of `------`. Correct the 
-     program using all of the suggestions. Use the following steps:
-     1. Combine similarly worded, but duplicate suggestions.
-     2. Decide if an alternative implementation or data structure is needed to implement the 
-        suggestions.
-     3. Follow the implications of the suggestions to their conclusions, such as removing `use` 
-        statements if you remove the items they import.
-     4. Choose the solution approach that implements all of the suggestions.
-     5. Write the code that implements the new solution.
-     6. Review and modify the code for solution correctness.
-     7. Review and modify the code for syntax errors.
-     8. Review and modify the code to ensure that all of the suggestions are implemented.
-     9. Ensure that the new code includes tests demonstrating that the original coding goal is
-        solved. 
-     10. Return the corrected code as JSON in a field called `code`.";
+const SYSTEM_PROMPT: &str = "
+    Correct the code, returning the fixed code as JSON in a string field called `code`.";
+
+const CODE_REVIEW_PROMPT: &str = "
+    Specifically address these code review issues:
+";
+
+const COMPILE_FIX_PROMPT: &str = "
+    Fix the code so that it compiles.
+    Correct the compilation errors without changing the code's functionality.
+    The code failed to compile with the following errors:
+";
+
+const TEST_FIX_PROMPT: &str = "
+    The code failed its unit tests as shown below. Fix the code so that it passes all tests.
+    1. Match the given `assert_id` value to the assert() in the code to find the assertion that 
+       failed.
+    2. Is the test correct? If not, write the correct test.
+    3. Is the assertion correct? If not, write the correct assertion.
+    4. Only if the test and assertion are correct, correct the non-test code.
+    This is the output of the failed test:
+";
+
+pub enum ReviewType {
+    CodeReview,
+    CompilerFix,
+    TestFix,
+}
+
+pub struct ReviewNeeded {
+    pub review_type: ReviewType,
+    pub comments: Vec<String>,
+}
 
 pub struct FixerAgent {
     pub name: String,
@@ -47,15 +63,30 @@ impl FixerAgent {
     pub async fn chat(
         &self,
         pb: &mut DoublingProgressBar,
-        goal: &str,
         code: &str,
-        suggestions: &[String],
+        review: ReviewNeeded,
     ) -> Result<Code> {
+        let review_prompt = match review.review_type {
+            ReviewType::CodeReview => CODE_REVIEW_PROMPT,
+            ReviewType::CompilerFix => COMPILE_FIX_PROMPT,
+            ReviewType::TestFix => TEST_FIX_PROMPT,
+        };
         let msg = format!(
-            "{}\n\n------\n\n{}\n\n------\n\n{}",
-            goal,
+            "{}\n\n{}\n\n{}",
+            review_prompt,
+            review
+                .comments
+                .iter()
+                .map(|comment| format!("• {}", comment))
+                .collect::<Vec<_>>()
+                .join("\n"),
             code,
-            suggestions.join("\n\n------\n\n")
+        );
+
+        log::info!(
+            "Review request for {} is {} characters.",
+            self.name,
+            msg.len(),
         );
 
         let user_msg = ChatCompletionRequestUserMessageArgs::default()
@@ -76,20 +107,6 @@ impl FixerAgent {
                 self.name, extra_keys
             );
         }
-        // TODO: Remove.
-        match serde_json::from_value::<Code>(json.clone()) {
-            Ok(result) => Ok(result),
-            Err(e) => {
-                eprintln!("Error deserializing JSON: {}", e);
-                if let serde_json::error::Category::Data = e.classify() {
-                    eprintln!(
-                        "Data error: The structure of the JSON does not match the expected format. The icky JSON is:\n\n{:?}\n\n", json.clone()
-                    );
-                }
-
-                Err(e.into())
-            }
-        }
-        // Ok(serde_json::from_value(json)?)
+        Ok(serde_json::from_value(json)?)
     }
 }
