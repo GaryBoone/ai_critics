@@ -12,7 +12,7 @@ use color_eyre::eyre::Result;
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use tokio::time::timeout;
+use tokio::time::timeout; // Add this import statement
 
 const MODEL: &str = "gpt-4-1106-preview";
 //const MODEL: &str = "gpt-4"; // Try comparing.
@@ -27,7 +27,7 @@ const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(30)
 // Instead, we'll allow only MAX_CONSECUTIVE_BLANKS consecutive empty chunks in the response stream.
 const MAX_CONSECUTIVE_BLANKS: usize = 300;
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum ProcessingOutcome {
     ApiSuccess(String, Option<FinishReason>),
     Retry,
@@ -43,6 +43,10 @@ impl ChatterJSON {
         ChatterJSON {
             client: Client::new(),
         }
+    }
+
+    pub fn with_client(client: Client<OpenAIConfig>) -> Self {
+        ChatterJSON { client }
     }
 
     fn create_request(
@@ -345,4 +349,161 @@ impl ChatterJSON {
             None => Err(AiCriticError::NotJsonObject.into()),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{errors::AiCriticError, DoublingProgressBar};
+    use async_openai::{
+        config::OpenAIConfig,
+        types::{
+            ChatCompletionRequestMessage, ChatCompletionResponseFormat,
+            ChatCompletionResponseFormatType, CreateChatCompletionRequest,
+            CreateChatCompletionRequestArgs, FinishReason,
+        },
+        Client,
+    };
+    use color_eyre::eyre::Result;
+    use futures::StreamExt;
+    use serde_json::{json, Map, Value};
+    use std::collections::HashSet;
+    use tokio::time::timeout; // Add this import statement
+
+    #[test]
+    fn test_process_stop_with_code() {
+        let json_str = r#"{"code": "print('Hello, World!')"}"#.to_string();
+        let result = ChatterJSON::process_stop(json_str).unwrap();
+        assert_eq!(
+            result,
+            ProcessingOutcome::Done(json!({"code": "print('Hello, World!')"}))
+        );
+    }
+
+    #[test]
+    fn test_process_stop_without_code() {
+        let json_str = r#"{"message": "Hello, World!"}"#.to_string();
+        let result = ChatterJSON::process_stop(json_str).unwrap();
+        assert_eq!(
+            result,
+            ProcessingOutcome::Done(json!({"message": "Hello, World!"}))
+        );
+    }
+
+    #[test]
+    fn test_process_stop_with_invalid_json() {
+        let json_str = r#"{"code": "print('Hello, World!')"#.to_string();
+        let result = ChatterJSON::process_stop(json_str);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "EOF while parsing a string at line 1 column 32"
+        );
+    }
+
+    #[test]
+    fn test_process_api_result_with_stop() {
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let json_str = r#"{"code": "print('Hello, World!')"}"#.to_string();
+        let finish_reason = Some(FinishReason::Stop);
+        let cj = ChatterJSON::new();
+        let result = cj
+            .process_api_result(&mut pb, json_str, finish_reason)
+            .unwrap();
+        assert_eq!(
+            result,
+            ProcessingOutcome::Done(json!({"code": "print('Hello, World!')"}))
+        );
+    }
+
+    #[test]
+    fn test_process_api_result_with_length() {
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap(); // Pass the required argument to the function.
+        let json_str = r#"{"message": "Hello, World!"}"#.to_string();
+        let finish_reason = Some(FinishReason::Length);
+        let cj = ChatterJSON::new();
+        let result = cj
+            .process_api_result(&mut pb, json_str, finish_reason)
+            .unwrap();
+        assert_eq!(result, ProcessingOutcome::Retry);
+    }
+
+    #[test]
+    fn test_process_api_result_with_unexpected_reason() {
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let json_str = r#"{"message": "Hello, World!"}"#.to_string();
+        let finish_reason = None;
+        let cj = ChatterJSON::new();
+        let result = cj
+            .process_api_result(&mut pb, json_str, finish_reason)
+            .unwrap();
+        assert_eq!(result, ProcessingOutcome::Retry);
+    }
+
+    #[test]
+    fn test_process_api_result_without_reason() {
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let json_str = r#"{"message": "Hello, World!"}"#.to_string();
+        let finish_reason = None;
+        let cj = ChatterJSON::new();
+        let result = cj
+            .process_api_result(&mut pb, json_str, finish_reason)
+            .unwrap();
+        assert_eq!(result, ProcessingOutcome::Retry);
+    }
+
+    // #[test]
+    // fn test_chat_with_successful_response() {
+    //     let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+    //     let msgs = vec![ChatCompletionRequestMessage {
+    //         role: "system".to_string(),
+    //         content: "Hello, World!".to_string(),
+    //     }];
+    //     let result = chat(&pb, &msgs).unwrap();
+    //     assert_eq!(result, json!({"message": "Hello, World!"}));
+    // }
+
+    // #[test]
+    // fn test_chat_with_retry_response() {
+    //     let mut pb = DoublingProgressBar::new("test_progress_bar");
+    //     let msgs = vec![ChatCompletionRequestMessage {
+    //         role: "system".to_string(),
+    //         content: "Hello, World!".to_string(),
+    //     }];
+    //     let result = chat(&pb, &msgs);
+    //     assert!(result.is_err());
+    //     assert_eq!(
+    //         result.unwrap_err().to_string(),
+    //         "maximum retries exceeded: 3"
+    //     );
+    // }
+
+    // #[test]
+    // fn test_validate_fields_with_valid_fields() {
+    //     let value = json!({"name": "John", "age": 30});
+    //     let fields = vec!["name", "age"];
+    //     let result = ChatterJSON::validate_fields(&value, fields).unwrap();
+    //     assert_eq!(result, vec![]);
+    // }
+
+    // #[test]
+    // fn test_validate_fields_with_missing_fields() {
+    //     let value = json!({"name": "John"});
+    //     let fields = vec!["name", "age"];
+    //     let result = ChatterJSON::validate_fields(&value, fields);
+    //     assert!(result.is_err());
+    //     assert_eq!(
+    //         result.unwrap_err().to_string(),
+    //         "missing JSON fields: [\"age\"]"
+    //     );
+    // }
+
+    // #[test]
+    // fn test_validate_fields_with_non_object_value() {
+    //     let value = json!(42);
+    //     let fields = vec!["name", "age"];
+    //     let result = ChatterJSON::validate_fields(&value, fields);
+    //     assert!(result.is_err());
+    //     assert_eq!(result.unwrap_err().to_string(), "not a JSON object");
+    // }
 }
