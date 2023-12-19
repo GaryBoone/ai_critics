@@ -1,18 +1,22 @@
 use crate::{errors::AiCriticError, DoublingProgressBar};
 use async_openai::{
     config::OpenAIConfig,
+    error::OpenAIError,
     types::{
         ChatCompletionRequestMessage, ChatCompletionResponseFormat,
-        ChatCompletionResponseFormatType, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, FinishReason,
+        ChatCompletionResponseFormatType, ChatCompletionResponseStream,
+        CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionStreamResponse, FinishReason,
     },
     Client,
 };
+use async_trait::async_trait;
 use color_eyre::eyre::Result;
 use futures::StreamExt;
+use log::info;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
-use tokio::time::timeout; // Add this import statement
+use tokio::time::timeout;
 
 const MODEL: &str = "gpt-4-1106-preview";
 //const MODEL: &str = "gpt-4"; // Try comparing.
@@ -34,19 +38,42 @@ enum ProcessingOutcome {
     Done(Value),
 }
 
+// Define a trait for client behavior to allow testing without actually calling the OpenAI API.
+#[async_trait]
+pub trait OpenAIClientTrait {
+    async fn create_chat_stream(
+        &self,
+        request: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError>;
+}
+
+// Implement the trait for the real OpenAI Client.
+#[async_trait]
+impl OpenAIClientTrait for Client<OpenAIConfig> {
+    async fn create_chat_stream(
+        &self,
+        request: CreateChatCompletionRequest,
+    ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        self.chat().create_stream(request).await
+    }
+}
+
 pub struct ChatterJSON {
-    client: Client<OpenAIConfig>,
+    client: Box<dyn OpenAIClientTrait + Send + Sync>,
+}
+
+#[cfg(test)]
+impl ChatterJSON {
+    pub fn with_client(client: Box<dyn OpenAIClientTrait + Send + Sync>) -> Self {
+        ChatterJSON { client }
+    }
 }
 
 impl ChatterJSON {
     pub fn new() -> Self {
         ChatterJSON {
-            client: Client::new(),
+            client: Box::new(Client::new()),
         }
-    }
-
-    pub fn with_client(client: Client<OpenAIConfig>) -> Self {
-        ChatterJSON { client }
     }
 
     fn create_request(
@@ -78,7 +105,7 @@ impl ChatterJSON {
     // returned and watch for excessive blank chunks. Return true if the request should be retried.
     fn process_chunk(
         pb: &mut DoublingProgressBar,
-        response: async_openai::types::CreateChatCompletionStreamResponse,
+        response: CreateChatCompletionStreamResponse,
         chunks: &mut Vec<String>,
         consecutive_blanks: &mut usize,
         last_finish_reason: &mut Option<FinishReason>,
@@ -117,7 +144,7 @@ impl ChatterJSON {
         pb: &mut DoublingProgressBar,
         request: &CreateChatCompletionRequest,
     ) -> Result<ProcessingOutcome> {
-        let mut stream = self.client.chat().create_stream(request.clone()).await?;
+        let mut stream = self.client.create_chat_stream(request.clone()).await?;
         let mut chunks = vec![];
         let mut last_finish_reason: Option<FinishReason> = None;
 
@@ -304,10 +331,12 @@ impl ChatterJSON {
         msgs: &[ChatCompletionRequestMessage],
     ) -> Result<Value> {
         let request = Self::create_request(msgs)?;
+        info!("   ==> Request: {:?}", request);
 
         for i in 1..=MAX_RETRIES {
             match self.collect_chunks(pb, &request).await {
                 Ok(ProcessingOutcome::ApiSuccess(json_str, finish_reason)) => {
+                    info!("   ==> Response: {}", json_str);
                     match self.process_api_result(pb, json_str, finish_reason)? {
                         ProcessingOutcome::Done(value) => return Ok(value),
                         ProcessingOutcome::Retry => {}
@@ -318,8 +347,11 @@ impl ChatterJSON {
                     pb.reset_to_zero();
                 }
                 Ok(ProcessingOutcome::Done(_)) => unreachable!(),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    return Err(e);
+                }
             };
+            info!("Retry attempt: {}", i);
             println!("Retry attempt: {}", i);
         }
 
@@ -329,7 +361,8 @@ impl ChatterJSON {
         .into())
     }
 
-    // Validate fields from a JSON Value object.
+    // Validate fields from a JSON Value object. Return a list of missing fields as an error. Return
+    // any extra fields as a result. If they're the same, the result will be empty.
     pub fn validate_fields(value: &Value, fields: Vec<&str>) -> Result<Vec<String>> {
         // Iterate over fields if it's an object.
         match value.as_object() {
@@ -354,22 +387,99 @@ impl ChatterJSON {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{errors::AiCriticError, DoublingProgressBar};
-    use async_openai::{
-        config::OpenAIConfig,
-        types::{
-            ChatCompletionRequestMessage, ChatCompletionResponseFormat,
-            ChatCompletionResponseFormatType, CreateChatCompletionRequest,
-            CreateChatCompletionRequestArgs, FinishReason,
-        },
-        Client,
+    use crate::DoublingProgressBar;
+    use async_openai::types::{
+        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStreamMessage,
+        ChatCompletionStreamResponseDelta, CreateChatCompletionStreamResponse, Role,
     };
+    use async_openai::types::{CreateChatCompletionRequest, FinishReason};
+    use async_trait::async_trait;
     use color_eyre::eyre::Result;
-    use futures::StreamExt;
-    use serde_json::{json, Map, Value};
-    use std::collections::HashSet;
-    use tokio::time::timeout; // Add this import statement
+    use futures::stream;
+    use mockall::{mock, predicate::*};
+    use serde_json::json;
 
+    fn create_message(msg: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(msg)
+            .build()
+            .unwrap()
+            .into()
+    }
+
+    fn create_chunk(
+        msg: &str,
+        finish_reason: Option<FinishReason>,
+    ) -> CreateChatCompletionStreamResponse {
+        let chat_choice = ChatCompletionResponseStreamMessage {
+            index: 0,
+            #[allow(deprecated)]
+            delta: ChatCompletionStreamResponseDelta {
+                content: Some(msg.to_string()),
+                role: Some(Role::User),
+                tool_calls: None,
+                function_call: None, // Deprecated.
+            },
+            finish_reason,
+        };
+
+        CreateChatCompletionStreamResponse {
+            id: "1234".to_string(),
+            choices: vec![chat_choice],
+            created: 12345,
+            model: "test_model".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            system_fingerprint: None,
+        }
+    }
+
+    mock! {
+        pub OpenAIClient {
+            async fn create_chat_stream(&self, request: CreateChatCompletionRequest) -> Result<ChatCompletionResponseStream, OpenAIError>;
+        }
+    }
+
+    #[async_trait]
+    impl OpenAIClientTrait for MockOpenAIClient {
+        async fn create_chat_stream(
+            &self,
+            request: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+            self.create_chat_stream(request).await
+        }
+    }
+
+    fn make_mock(response_chunks: Vec<CreateChatCompletionStreamResponse>) -> MockOpenAIClient {
+        let mock_stream = stream::iter(response_chunks.into_iter().map(Ok));
+
+        // Setup the mock
+        let mut mock = MockOpenAIClient::new();
+        mock.expect_create_chat_stream()
+            .returning(move |_| Ok(Box::pin(mock_stream.clone())));
+        mock
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // check_for_excessive_blanks() tests
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    #[test]
+    fn test_check_for_excessive_blanks() {
+        let mut blanks = 0;
+
+        assert!(!ChatterJSON::check_for_excessive_blanks(&mut blanks, ""));
+        assert_eq!(blanks, 1);
+
+        assert!(!ChatterJSON::check_for_excessive_blanks(&mut blanks, "a"));
+        assert_eq!(blanks, 0);
+
+        blanks = MAX_CONSECUTIVE_BLANKS;
+        assert!(ChatterJSON::check_for_excessive_blanks(&mut blanks, "\n"));
+        assert_eq!(blanks, MAX_CONSECUTIVE_BLANKS + 1);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // process_stop() tests
+    ////////////////////////////////////////////////////////////////////////////////////////////////
     #[test]
     fn test_process_stop_with_code() {
         let json_str = r#"{"code": "print('Hello, World!')"}"#.to_string();
@@ -377,16 +487,6 @@ mod tests {
         assert_eq!(
             result,
             ProcessingOutcome::Done(json!({"code": "print('Hello, World!')"}))
-        );
-    }
-
-    #[test]
-    fn test_process_stop_without_code() {
-        let json_str = r#"{"message": "Hello, World!"}"#.to_string();
-        let result = ChatterJSON::process_stop(json_str).unwrap();
-        assert_eq!(
-            result,
-            ProcessingOutcome::Done(json!({"message": "Hello, World!"}))
         );
     }
 
@@ -400,6 +500,30 @@ mod tests {
             "EOF while parsing a string at line 1 column 32"
         );
     }
+
+    #[test]
+    fn test_process_stop_with_object_value() {
+        let json_str = r#"{"key": "value"}"#.to_string();
+        let result = ChatterJSON::process_stop(json_str).unwrap();
+        assert_eq!(result, ProcessingOutcome::Done(json!({"key": "value"})));
+    }
+
+    #[test]
+    fn test_process_stop_with_unexpected_json_structure() {
+        let json_str = r#"["an", "array"]"#.to_string();
+        let result = ChatterJSON::process_stop(json_str);
+        assert!(result.is_err());
+
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<AiCriticError>(),
+            Some(AiCriticError::UnexpectedJsonStructure { json: _ })
+        ));
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // process_api_result() tests
+    ////////////////////////////////////////////////////////////////////////////////////////////////
 
     #[test]
     fn test_process_api_result_with_stop() {
@@ -452,58 +576,319 @@ mod tests {
         assert_eq!(result, ProcessingOutcome::Retry);
     }
 
-    // #[test]
-    // fn test_chat_with_successful_response() {
-    //     let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
-    //     let msgs = vec![ChatCompletionRequestMessage {
-    //         role: "system".to_string(),
-    //         content: "Hello, World!".to_string(),
-    //     }];
-    //     let result = chat(&pb, &msgs).unwrap();
-    //     assert_eq!(result, json!({"message": "Hello, World!"}));
-    // }
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // process_chunk() tests
+    ////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // #[test]
-    // fn test_chat_with_retry_response() {
-    //     let mut pb = DoublingProgressBar::new("test_progress_bar");
-    //     let msgs = vec![ChatCompletionRequestMessage {
-    //         role: "system".to_string(),
-    //         content: "Hello, World!".to_string(),
-    //     }];
-    //     let result = chat(&pb, &msgs);
-    //     assert!(result.is_err());
-    //     assert_eq!(
-    //         result.unwrap_err().to_string(),
-    //         "maximum retries exceeded: 3"
-    //     );
-    // }
+    #[test]
+    fn test_process_chunk() {
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let mut chunks = Vec::new();
+        let mut consecutive_blanks = 0;
+        let mut last_finish_reason = None;
 
-    // #[test]
-    // fn test_validate_fields_with_valid_fields() {
-    //     let value = json!({"name": "John", "age": 30});
-    //     let fields = vec!["name", "age"];
-    //     let result = ChatterJSON::validate_fields(&value, fields).unwrap();
-    //     assert_eq!(result, vec![]);
-    // }
+        let response_chunk = create_chunk("Hello", Some(FinishReason::Stop));
+        let retry = ChatterJSON::process_chunk(
+            &mut pb,
+            response_chunk,
+            &mut chunks,
+            &mut consecutive_blanks,
+            &mut last_finish_reason,
+        );
+        assert!(!retry);
+        assert_eq!(chunks, vec!["Hello"]);
+    }
 
-    // #[test]
-    // fn test_validate_fields_with_missing_fields() {
-    //     let value = json!({"name": "John"});
-    //     let fields = vec!["name", "age"];
-    //     let result = ChatterJSON::validate_fields(&value, fields);
-    //     assert!(result.is_err());
-    //     assert_eq!(
-    //         result.unwrap_err().to_string(),
-    //         "missing JSON fields: [\"age\"]"
-    //     );
-    // }
+    #[test]
+    fn test_process_chunk_consecutive_blanks() {
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let mut chunks = Vec::new();
+        let mut consecutive_blanks = 0;
+        let mut last_finish_reason = None;
 
-    // #[test]
-    // fn test_validate_fields_with_non_object_value() {
-    //     let value = json!(42);
-    //     let fields = vec!["name", "age"];
-    //     let result = ChatterJSON::validate_fields(&value, fields);
-    //     assert!(result.is_err());
-    //     assert_eq!(result.unwrap_err().to_string(), "not a JSON object");
-    // }
+        // Test empty chunk.
+        let chunk = create_chunk("", None);
+        let retry = ChatterJSON::process_chunk(
+            &mut pb,
+            chunk,
+            &mut chunks,
+            &mut consecutive_blanks,
+            &mut last_finish_reason,
+        );
+        assert!(!retry);
+        assert_eq!(consecutive_blanks, 1);
+
+        let chunk = create_chunk(" ", None);
+        let retry = ChatterJSON::process_chunk(
+            &mut pb,
+            chunk,
+            &mut chunks,
+            &mut consecutive_blanks,
+            &mut last_finish_reason,
+        );
+        assert!(!retry);
+        assert_eq!(consecutive_blanks, 2);
+
+        let chunk = create_chunk(" \n   ", Some(FinishReason::Stop));
+        let retry = ChatterJSON::process_chunk(
+            &mut pb,
+            chunk,
+            &mut chunks,
+            &mut consecutive_blanks,
+            &mut last_finish_reason,
+        );
+        assert!(!retry);
+        assert_eq!(consecutive_blanks, 3);
+
+        // Test consecutive_blanks reset.
+        let chunk = create_chunk("a", None);
+        let retry = ChatterJSON::process_chunk(
+            &mut pb,
+            chunk,
+            &mut chunks,
+            &mut consecutive_blanks,
+            &mut last_finish_reason,
+        );
+        assert!(!retry);
+        assert_eq!(consecutive_blanks, 0);
+
+        // Too many consecutive blanks.
+        consecutive_blanks = MAX_CONSECUTIVE_BLANKS;
+        let chunk = create_chunk(" ", Some(FinishReason::Stop));
+        let retry = ChatterJSON::process_chunk(
+            &mut pb,
+            chunk,
+            &mut chunks,
+            &mut consecutive_blanks,
+            &mut last_finish_reason,
+        );
+        assert!(retry);
+        assert_eq!(consecutive_blanks, MAX_CONSECUTIVE_BLANKS + 1);
+    }
+
+    #[test]
+    fn test_process_chunk_finish_reason() {
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let mut chunks = Vec::new();
+        let mut consecutive_blanks = 0;
+        let mut last_finish_reason = None;
+
+        // Test empty chunk.
+        let chunk = create_chunk("foo", Some(FinishReason::Stop));
+        let retry = ChatterJSON::process_chunk(
+            &mut pb,
+            chunk,
+            &mut chunks,
+            &mut consecutive_blanks,
+            &mut last_finish_reason,
+        );
+        assert!(!retry);
+        assert_eq!(last_finish_reason, Some(FinishReason::Stop));
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // collect_chunks() tests
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    #[tokio::test]
+    async fn test_collect_chunks() {
+        let msg = create_message("Request: Hello");
+
+        let request = ChatterJSON::create_request(&[msg]).unwrap();
+
+        let response_chunks = vec![create_chunk(
+            r#"{"message": "Hello, World!"}"#,
+            Some(FinishReason::Stop),
+        )];
+
+        let mock = make_mock(response_chunks);
+        let chatter = ChatterJSON::with_client(Box::new(mock));
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let result = chatter.collect_chunks(&mut pb, &request).await.unwrap();
+        assert_eq!(
+            result,
+            ProcessingOutcome::ApiSuccess(
+                r#"{"message": "Hello, World!"}"#.to_string(),
+                Some(FinishReason::Stop)
+            )
+        );
+    }
+    #[tokio::test]
+    async fn test_collect_chunks_length() {
+        let msg = create_message("Request: Hello");
+
+        let request = ChatterJSON::create_request(&[msg]).unwrap();
+
+        let response_chunks = vec![create_chunk(
+            r#"{"message": "Hello, World!"}"#,
+            Some(FinishReason::Length),
+        )];
+
+        let mock = make_mock(response_chunks);
+        let chatter = ChatterJSON::with_client(Box::new(mock));
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let result = chatter.collect_chunks(&mut pb, &request).await.unwrap();
+        assert_eq!(
+            result,
+            ProcessingOutcome::ApiSuccess(
+                r#"{"message": "Hello, World!"}"#.to_string(),
+                Some(FinishReason::Length)
+            )
+        );
+    }
+    #[tokio::test]
+    async fn test_collect_chunks_too_many_blanks() {
+        let msg = create_message("Request: Hello");
+
+        let request = ChatterJSON::create_request(&[msg]).unwrap();
+
+        let response_chunks =
+            vec![create_chunk("", Some(FinishReason::Stop)); MAX_CONSECUTIVE_BLANKS + 1];
+
+        let mock = make_mock(response_chunks);
+        let chatter = ChatterJSON::with_client(Box::new(mock));
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let result = chatter.collect_chunks(&mut pb, &request).await.unwrap();
+        assert_eq!(result, ProcessingOutcome::Retry);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // chat() tests
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    #[tokio::test]
+    async fn test_chat_with_successful_response() {
+        let request = create_message("Request: Hello, World!");
+
+        let response_chunks = vec![create_chunk(
+            r#"{"message": "Hello, World!"}"#,
+            Some(FinishReason::Stop),
+        )];
+
+        let mock = make_mock(response_chunks);
+        let chatter = ChatterJSON::with_client(Box::new(mock));
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let result = chatter.chat(&mut pb, &[request]).await.unwrap();
+        assert_eq!(result, json!({"message": "Hello, World!"})); // Adjust this assertion based on your actual expected output
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_successful_multipart_request() {
+        let msgs = [
+            create_message("Request: "),
+            create_message("Hello, "),
+            create_message("World!"),
+        ];
+
+        let response_chunks = vec![create_chunk(
+            r#"{"message": "Hello, World!"}"#,
+            Some(FinishReason::Stop),
+        )];
+        let mock = make_mock(response_chunks);
+        let chatter = ChatterJSON::with_client(Box::new(mock));
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let result = chatter.chat(&mut pb, &msgs).await.unwrap();
+        assert_eq!(result, json!({"message": "Hello, World!"})); // Adjust this assertion based on your actual expected output
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_successful_multipart_response() {
+        let request = create_message("Request: Hello, World!");
+
+        let response_chunks = vec![
+            create_chunk(r#"{"message""#, None),
+            create_chunk(r#": "Hello"#, None),
+            create_chunk(r#", World!"}"#, Some(FinishReason::Stop)),
+        ];
+
+        let mock = make_mock(response_chunks);
+        let chatter = ChatterJSON::with_client(Box::new(mock));
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let result = chatter.chat(&mut pb, &[request]).await.unwrap();
+        assert_eq!(result, json!({"message": "Hello, World!"})); // Adjust this assertion based on your actual expected output
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_max_retries() {
+        let request = create_message("Request: Hello, World!");
+
+        let response_chunks = vec![create_chunk("", None); MAX_RETRIES + 1];
+
+        let mock = make_mock(response_chunks);
+        let chatter = ChatterJSON::with_client(Box::new(mock));
+        let mut pb = DoublingProgressBar::new("test_progress_bar").unwrap();
+        let result = chatter.chat(&mut pb, &[request]).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("too many API retries: {}", MAX_RETRIES)
+        );
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // validate_fields() tests
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Test valid fields
+    #[test]
+    fn test_validate_fields_valid() {
+        let fields = vec!["field1", "field2"];
+        let value = json!({
+          "field1": "value1",
+          "field2": "value2"
+        });
+
+        let fields = ChatterJSON::validate_fields(&value, fields).unwrap();
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn test_validate_fields_extra() {
+        let fields = vec!["field1", "field2"];
+        let value = json!({
+          "field1": "value1",
+          "field2": "value2",
+          "field3": "value3"
+        });
+
+        let extra_fields = ChatterJSON::validate_fields(&value, fields).unwrap();
+        assert_eq!(extra_fields, vec!["field3"]);
+    }
+
+    #[test]
+    fn test_validate_fields_missing() {
+        let fields = vec!["field1", "field2"];
+        let value = json!({
+          "field1": "value1"
+        });
+
+        match ChatterJSON::validate_fields(&value, fields) {
+            Ok(_) => panic!("Expected an error for missing fields, but got Ok"),
+            Err(e) => match e.downcast_ref::<AiCriticError>() {
+                Some(AiCriticError::MissingJsonFields { fields }) => {
+                    let expected_missing: HashSet<_> = ["field2"].iter().cloned().collect();
+                    let actual_missing: HashSet<_> = fields.iter().map(|s| s.as_str()).collect();
+                    assert_eq!(
+                        expected_missing, actual_missing,
+                        "Unexpected missing fields"
+                    );
+                }
+                _ => panic!("Expected MissingJsonFields error, got different error"),
+            },
+        }
+    }
+
+    #[test]
+    fn test_validate_fields_not_json_object() {
+        let value = json!("This is not a JSON object");
+
+        let fields = vec!["field1", "field2"]; // These fields are irrelevant in this case
+
+        match ChatterJSON::validate_fields(&value, fields) {
+            Ok(_) => panic!("Expected an error for non-object JSON, but got Ok"),
+            Err(e) => match e.downcast_ref::<AiCriticError>() {
+                Some(AiCriticError::NotJsonObject) => {}
+                _ => panic!("Expected NotJsonObject error, got different error"),
+            },
+        }
+    }
 }
