@@ -106,6 +106,9 @@ async fn ai_write_code(goal: &str) -> Result<Code> {
     Ok(code)
 }
 
+// Spawn the critics' API calls as parallel tasks. Return the tasks so that they can be joined
+// later. Also return a MultiProgress bar so that the progress bars can be managed as a group for
+// all of the critics.
 fn spawn_critics(
     critics: Vec<CriticAgent>,
     problem: &str,
@@ -126,6 +129,8 @@ fn spawn_critics(
     Ok((tasks, multi_progress))
 }
 
+// Combine the results of the given critics into a single vector. Return an error if any of the
+// critics failed.
 fn collect_comments(
     results: Vec<Result<Result<Correction>, tokio::task::JoinError>>,
 ) -> Result<Vec<Correction>> {
@@ -146,8 +151,8 @@ fn print_corrections(corrections: &[Correction]) {
     println!("Critic results:");
     for c in corrections.iter() {
         println!("  {}:", c.name);
-        println!("    Correct? {}", c.correct);
-        if !c.correct {
+        println!("    Correct? {}", c.lgtm);
+        if !c.lgtm {
             for s in c.corrections.iter() {
                 println!("    • {}", s);
             }
@@ -185,18 +190,18 @@ async fn ai_review_code(
 
     print_corrections(&corrections);
 
-    if corrections.iter().all(|item| item.correct) {
+    if corrections.iter().all(|item| item.lgtm) {
         println!("All of the critics agree that code is correct.");
         return Ok(None);
     }
 
-    // For the Corrections that are incorrect, collect the review comments into a HashSet, deduping
-    // them. Note that comments from GPT are often the same idea but using different words, so
-    // this deduplication only removes the less frequent literal duplicates. Return them as a
-    // Vec<String>.
+    // For the Corrections that say the code is incorrect, collect the review comments into a
+    // HashSet, deduping them. Note that comments from GPT are often the same idea but using
+    // different words, so this deduplication only removes the less frequent literal duplicates.
+    // Return them as a Vec<String>.
     let comments: Vec<String> = corrections
         .iter()
-        .filter(|cs| !cs.correct)
+        .filter(|cs| !cs.lgtm)
         .flat_map(|cs| &cs.corrections)
         .cloned()
         .collect::<HashSet<String>>()
@@ -209,6 +214,11 @@ async fn ai_review_code(
     }))
 }
 
+// Create the set of critics, whether general or specific, based on the requested number of critics.
+// Note that if the general_critics_only flag is set, then the number of general critics is the
+// requested number of critics. Otherwise, the total number of critics is the requested number * 3
+// because there is one design, one correctness, and one syntax critic for each requested number of
+// critics.
 fn create_critics(num_critics: usize, general_critics_only: bool) -> Result<Vec<CriticAgent>> {
     let mut critics = vec![];
     if general_critics_only {
@@ -229,6 +239,7 @@ fn create_critics(num_critics: usize, general_critics_only: bool) -> Result<Vec<
     Ok(critics)
 }
 
+// Pretty print the current code and iteration count.
 fn report_test_success(proposal_count: usize, code: &str, test_output: &str) {
     println!(
         indoc! {"
@@ -246,6 +257,7 @@ fn report_test_success(proposal_count: usize, code: &str, test_output: &str) {
     );
 }
 
+// Pretty print the current error.
 fn report_tester_failure(stderr: &str) {
     println!(
         indoc! {"

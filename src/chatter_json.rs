@@ -179,9 +179,7 @@ impl ChatterJSON {
 
     fn describe_value(value: &Value, indent: usize) {
         match value {
-            Value::Object(map)
-                if map.contains_key("correct") && map.contains_key("corrections") =>
-            {
+            Value::Object(map) if map.contains_key("lgtm") && map.contains_key("corrections") => {
                 log::info!("{}> Found a Correction", "-".repeat(indent));
             }
             Value::Object(map) if map.contains_key("code") => {

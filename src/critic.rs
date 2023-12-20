@@ -22,7 +22,7 @@ use serde_json::Value;
 const BASE_PROMPT: &str = "
     Evaluate this code based on the criteria below. Make no comments or explanations.
     Return JSON with two fields:
-    1. a field named `correct` with value `true` if the code is correct, else false.
+    1. a field named `lgtm` with value `true` if the code is correct, else `false`.
     2. a field `corrections` containing list of the errors, if any, else `None`.
 ";
 
@@ -74,7 +74,7 @@ pub struct Correction {
     #[serde(skip_deserializing)]
     pub name: String,
     #[serde(default)]
-    pub correct: bool,
+    pub lgtm: bool,
     #[serde(deserialize_with = "deserialize_corrections")]
     pub corrections: Vec<String>,
 }
@@ -86,7 +86,7 @@ where
 {
     let v = Value::deserialize(deserializer)?;
     match v {
-        Value::Null => Ok(Vec::new()), // Handle null as empty Vec
+        Value::Null => Ok(Vec::new()), // Handle null as empty Vec.
         Value::Array(arr) => arr
             .into_iter()
             .map(|val| {
@@ -142,8 +142,8 @@ impl CriticAgent {
             .chat(pb, &[self.system_msg.clone(), user_msg])
             .await?;
 
-        // Check the fields. Should only be two: `correct` and `corrections`.
-        let extra_keys = ChatterJSON::validate_fields(&json, vec!["correct", "corrections"])?;
+        // Check the fields. Should only be two: `lgtm` and `corrections`.
+        let extra_keys = ChatterJSON::validate_fields(&json, vec!["lgtm", "corrections"])?;
         if !extra_keys.is_empty() {
             println!(
                 "{}: Warning: Extra keys in critic response: {:?}",
@@ -154,5 +154,36 @@ impl CriticAgent {
         let mut correction: Correction = serde_json::from_value(json)?;
         correction.name = self.name.clone();
         Ok(correction)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_corrections() {
+        // Test case 1: Empty array
+        let input1 = Value::Array(vec![]);
+        let result1 = deserialize_corrections(&input1).unwrap();
+        assert!(result1.is_empty());
+
+        // Test case 2: Array with strings
+        let input2 = Value::Array(vec![
+            Value::String("error1".to_string()),
+            Value::String("error2".to_string()),
+        ]);
+        let result2 = deserialize_corrections(&input2).unwrap();
+        assert_eq!(result2, vec!["error1", "error2"]);
+
+        // Test case 3: Null value
+        let input3 = Value::Null;
+        let result3 = deserialize_corrections(&input3).unwrap();
+        assert!(result3.is_empty());
+
+        // Test case 4: Invalid input (not an array or null)
+        let input4 = Value::Bool(true);
+        let result4 = deserialize_corrections(&input4);
+        assert!(result4.is_err());
     }
 }
